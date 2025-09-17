@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         "Viktor",
         "Viktor",
         "I'm Viktor, just a dude.",
-        "https://jskitty.cat/vector/img/app-logo.jpg",
+        "https://jskitty.cat/vector/img/viktor.png",
         "https://jskitty.cat/vector/img/app-logo.jpg",
         "",
         "",
