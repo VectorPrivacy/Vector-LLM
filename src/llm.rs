@@ -1,10 +1,14 @@
+//! Minimal client for any OpenAI-compatible `/chat/completions` endpoint.
+//!
+//! Requests go through the Vector SDK's hardened HTTP client (the same one Vector uses
+//! everywhere), so the bot's LLM traffic inherits its Tor failsafe and SSRF guards.
+
 use anyhow::{anyhow, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use vector_sdk::vector_core::net::build_http_client;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -12,136 +16,129 @@ pub enum Role {
     Assistant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
 }
 
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: Role::System, content: content.into() }
+    }
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: Role::User, content: content.into() }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: content.into() }
+    }
+}
+
 #[derive(Clone)]
 pub struct LLMClient {
-    http: HttpClient,
-    pub base_url: String,
-    pub api_key: Option<String>,
-    pub model: String,
-    pub temperature: f32,
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+    temperature: f32,
+    max_tokens: Option<u32>,
 }
 
 impl LLMClient {
-    // Return a cloned client with a different model name
-    pub fn with_model(&self, model: impl Into<String>) -> Self {
-        let mut c = self.clone();
-        c.model = model.into();
-        c
-    }
-}
-
-impl LLMClient {
-    pub fn new(base_url: String, api_key: Option<String>, model: String, temperature: f32) -> Self {
-        let http = HttpClient::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .expect("failed to build reqwest client");
-        Self {
-            http,
-            base_url,
-            api_key,
-            model,
-            temperature,
-        }
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        temperature: f32,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self { base_url, api_key, model, temperature, max_tokens }
     }
 
+    /// Send a chat completion and return the assistant's reply text.
     pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String> {
-        // OpenAI-compatible /chat/completions
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(key) = &self.api_key {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", key)).unwrap(),
-            );
-        }
-
         let payload = ChatRequest {
-            model: self.model.clone(),
-            temperature: Some(self.temperature),
+            model: &self.model,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
             messages: messages
-                .into_iter()
-                .map(|m| OpenAIMessage {
-                    role: match m.role {
-                        Role::System => "system".into(),
-                        Role::User => "user".into(),
-                        Role::Assistant => "assistant".into(),
-                    },
-                    content: m.content,
-                })
+                .iter()
+                .map(|m| WireMessage { role: m.role.as_str(), content: &m.content })
                 .collect(),
         };
 
-        let resp = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&payload)
-            .send()
-            .await?;
+        let http = build_http_client(Duration::from_secs(60)).map_err(|e| anyhow!(e))?;
+        let mut req = http.post(url).json(&payload);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
 
-        // Capture status, then fully read the body once.
+        let resp = req.send().await?;
         let status = resp.status();
         let bytes = resp.bytes().await?;
-
         if !status.is_success() {
-            let text = String::from_utf8_lossy(&bytes).to_string();
-            return Err(anyhow!("LLM HTTP error: {} - {}", status, text));
+            return Err(anyhow!(
+                "LLM HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            ));
         }
 
-        // Parse JSON from the buffered bytes to avoid moving the response twice.
         let body: ChatResponse = serde_json::from_slice(&bytes)?;
-        let choice = body.choices.get(0).ok_or_else(|| anyhow!("no choices in response"))?;
+        let choice = body.choices.into_iter().next().ok_or_else(|| anyhow!("no choices in response"))?;
 
-        // Primary: chat format
-        if let Some(msg) = &choice.message {
-            if !msg.content.is_empty() {
-                return Ok(msg.content.clone());
-            }
-        }
-        // Fallback: some servers still return "text" instead of "message"
-        if let Some(text) = &choice.text {
-            if !text.is_empty() {
-                return Ok(text.clone());
-            }
-        }
-
-        Err(anyhow!("empty assistant content"))
+        // Primary: chat format; fall back to legacy "text" some servers still emit.
+        let content = choice
+            .message
+            .map(|m| m.content)
+            .or(choice.text)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("empty assistant content"))?;
+        Ok(content)
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    messages: Vec<OpenAIMessage>,
+    max_tokens: Option<u32>,
+    messages: Vec<WireMessage<'a>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct OpenAIMessage {
-    role: String,
-    content: String,
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'a str,
+    content: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Choice {
     #[serde(default)]
-    message: Option<OpenAIMessage>,
-    // Some OpenAI-compatible servers may provide "text" (legacy)
+    message: Option<OwnedMessage>,
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OwnedMessage {
+    #[serde(default)]
+    content: String,
 }

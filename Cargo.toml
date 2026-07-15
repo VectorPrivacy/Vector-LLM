@@ -1,22 +1,21 @@
 [package]
 name = "vector-llm-bot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 authors = ["Vector LLM Bot"]
 
 [dependencies]
-vector_sdk = "0.2.1"
+# The Vector SDK (discord.js-style): unified DM + group-chat messaging, communities,
+# reconnect/catch-up, and a re-exported `vector_core` (hardened HTTP client, raw client).
+vector_sdk = "0.4"
+# Matches the SDK's nostr-sdk so the raw `Client` types unify. Only used by Public
+# (firehose) mode, which drops to the raw relay client for kind:1 monitoring.
+nostr-sdk = "0.44"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-dotenvy = "0.15"
-url = "2.5"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 hex = "0.4"
-
-# Optional: small CLI helper for local testing flows (not required for the SDK usage)
-# clap = { version = "4", features = ["derive"] }
