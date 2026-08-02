@@ -12,6 +12,7 @@ mod llm;
 mod memory;
 mod names;
 mod prompt;
+#[cfg(feature = "public")]
 mod public;
 mod util;
 
@@ -101,20 +102,36 @@ async fn main() -> Result<()> {
 
     // Public (firehose) mode runs as an independent consumer on the shared relay client, alongside
     // the SDK's own DM/Community listen loop.
-    if cfg.public_mode {
-        match vector_sdk::vector_core::state::nostr_client() {
-            Some(client) => {
-                let pm = public::PublicMode::new(
-                    client,
-                    cfg.clone(),
-                    llm.clone(),
-                    names.clone(),
-                    &bot_npub,
-                )?;
-                tokio::spawn(Arc::new(pm).run());
+    #[cfg(feature = "public")]
+        if cfg.public_mode {
+            match vector_sdk::vector_core::state::nostr_client() {
+                Some(client) => {
+                    let pm = public::PublicMode::new(
+                        client,
+                        cfg.clone(),
+                        llm.clone(),
+                        names.clone(),
+                        &bot_npub,
+                    )?;
+                    tokio::spawn(Arc::new(pm).run());
+                }
+                None => warn!("Public mode enabled but no relay client is available; skipping it"),
             }
-            None => warn!("Public mode enabled but no relay client is available; skipping it"),
         }
+
+    // Asking for a mode this binary cannot provide must be loud. Silently
+    // ignoring PUBLIC_MODE=true would look identical to "the firehose is quiet",
+    // and you'd debug relays for an hour before suspecting the build.
+    #[cfg(not(feature = "public"))]
+    if cfg.public_mode {
+        anyhow::bail!(
+            "PUBLIC_MODE=true but this binary was built without the `public` feature.\n\
+             Public mode is disabled by default since SDK 0.6: nostr-sdk 0.45 removed signing \n\
+             from `Client`, so the firehose path cannot post replies without reworking how the \n\
+             bot signs events.\n\
+             Either set PUBLIC_MODE=false, or rebuild with `cargo build --release --features public` \n\
+             once that rework is done."
+        );
     }
 
     let ctx = Arc::new(Ctx { cfg, llm, names, store, bot_npub, bot_hex });

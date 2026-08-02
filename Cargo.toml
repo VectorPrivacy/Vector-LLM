@@ -8,10 +8,14 @@ authors = ["Vector LLM Bot"]
 [dependencies]
 # The Vector SDK (discord.js-style): unified DM + group-chat messaging, communities,
 # reconnect/catch-up, and a re-exported `vector_core` (hardened HTTP client, raw client).
-vector_sdk = "0.4"
-# Matches the SDK's nostr-sdk so the raw `Client` types unify. Only used by Public
-# (firehose) mode, which drops to the raw relay client for kind:1 monitoring.
-nostr-sdk = "0.44"
+vector_sdk = "0.6"
+# Must match vector_sdk's nostr-sdk EXACTLY or the raw `Client` types are two
+# distinct types and public mode will not compile. Pinned with `=` deliberately:
+# newer alphas exist, and a loose spec silently drifts off whatever the SDK
+# resolved to. Bump in lockstep with vector_sdk, never on its own.
+# Only needed by the optional `public` feature, which drops to the raw relay
+# client for kind:1 monitoring.
+nostr-sdk = { version = "=0.45.0-alpha.5", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -19,3 +23,11 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 hex = "0.4"
+
+[features]
+# The kind:1 firehose. OFF by default: nostr-sdk 0.45 removed signing from
+# `Client`, so public.rs can no longer post replies without holding the bot's
+# nsec and signing them itself. That's a key-handling change worth making
+# deliberately, not as a side effect of an SDK bump. DM and group modes are
+# unaffected and remain the default build.
+public = ["nostr-sdk"]
