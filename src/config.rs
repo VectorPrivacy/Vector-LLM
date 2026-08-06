@@ -1,5 +1,5 @@
-//! Configuration, loaded once from the environment (a `.env` file is read into the
-//! process environment at startup by `dotenvy`, so plain `std::env::var` is all we need).
+//! Configuration, loaded once from the environment. [`load_env_file`] folds `.env` into the
+//! process environment first, so everything below is a plain `std::env::var` read.
 
 use anyhow::{bail, Result};
 use std::str::FromStr;
@@ -58,13 +58,25 @@ pub struct Config {
     pub invite_policy: InvitePolicyKind,
     pub invite_whitelist: Vec<String>,
 
+    // --- Private channels ---
+    /// Post a short greeting when a private channel's key arrives, so the admin who granted
+    /// access sees it worked. Off by default: an unprompted message in a private channel is
+    /// the caller's call to make, and the startup/keyed log lines already make it diagnosable.
+    pub announce_channel_access: bool,
+
     // --- Public firehose mode (kind:1 monitoring) ---
+    // Always parsed (so PUBLIC_MODE=true can be rejected with a clear error rather than silently
+    // ignored), but only *read* by the feature-gated `public` module.
     pub public_mode: bool,
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub public_system_prompt: String,
     pub public_dry_run: bool,
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub public_rate_limit_secs: u64,
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub public_whitelist: Vec<String>,
     /// If non-empty, only public posts containing one of these keywords are considered.
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub public_keywords: Vec<String>,
 }
 
@@ -126,6 +138,8 @@ impl Config {
             invite_policy,
             invite_whitelist: env_list("INVITE_WHITELIST"),
 
+            announce_channel_access: env_bool("ANNOUNCE_CHANNEL_ACCESS", false),
+
             public_mode: env_bool("PUBLIC_MODE", false),
             public_system_prompt: unescape(&env_str(
                 "PUBLIC_SYSTEM_PROMPT",
@@ -142,11 +156,13 @@ impl Config {
     }
 
     /// Whether an npub is in the public-mode whitelist (bypasses rate limit + blacklist).
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub fn is_public_whitelisted(&self, npub: &str) -> bool {
         self.public_whitelist.iter().any(|w| w == npub)
     }
 
     /// Whether public post content/hashtags match the keyword filter (empty filter = match all).
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub fn matches_keywords(&self, content: &str, hashtags: &[String]) -> bool {
         if self.public_keywords.is_empty() {
             return true;

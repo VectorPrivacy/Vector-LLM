@@ -39,6 +39,7 @@ impl NameResolver {
     }
 
     /// A short, stable display label for an npub: its name if it has one, else a truncated npub.
+    #[cfg_attr(not(feature = "public"), allow(dead_code))]
     pub async fn label_of(&self, npub: &str) -> String {
         self.name_of(npub).await.unwrap_or_else(|| short_npub(npub))
     }

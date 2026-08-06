@@ -23,7 +23,7 @@ use env_logger::Env;
 use log::{error, info, warn};
 
 use vector_sdk::nostr::{FromBech32, PublicKey, SecretKey, ToBech32};
-use vector_sdk::{IncomingMessage, VectorBot};
+use vector_sdk::{BotEvent, IncomingMessage, VectorBot};
 
 use crate::config::{Config, InvitePolicyKind};
 use crate::llm::LLMClient;
@@ -151,19 +151,138 @@ async fn main() -> Result<()> {
         });
     }
 
-    info!("Listening for messages…");
+    info!("Connecting…");
 
-    // One handler for DMs and Community group channels alike. The SDK runs each invocation in its
-    // own task, so a slow LLM call never blocks other conversations.
-    bot.on_message(move |bot, msg| {
+    // `on_event` rather than `on_message`: a superset that also carries Ready and ChannelKeyed.
+    // Slash commands are consumed upstream by the SDK on both paths, so /clear is unaffected.
+    bot.on_event(move |bot, event| {
         let ctx = ctx.clone();
         async move {
-            handle_message(bot, msg, ctx).await;
+            match event {
+                BotEvent::Message(msg) => handle_message(bot, msg, ctx).await,
+                // The live subscription is registered: from here we actually hear traffic, and
+                // community state has been caught up, so this is the first honest moment to
+                // report what we can see.
+                BotEvent::Ready { communities } => {
+                    info!("✅ Subscribed and listening ({communities} communities)");
+                    report_channel_inventory(&bot).await;
+                }
+                BotEvent::ChannelKeyed { community_id, channel_id, backfilled } => {
+                    handle_channel_keyed(bot, ctx, &community_id, &channel_id, backfilled).await
+                }
+                _ => {}
+            }
         }
     })
     .await?;
 
     Ok(())
+}
+
+/// Log every community channel and how this bot stands with it.
+///
+/// An unreadable private channel is two different situations, and only one is a problem:
+/// we were never granted access (normal, and most private channels are this), or we hold the
+/// access role and the key hasn't landed (the state that otherwise looks like an idle channel).
+/// The channel's access roster tells them apart, so only the second warns.
+async fn report_channel_inventory(bot: &VectorBot) {
+    for community in bot.communities().await {
+        let channels = community.channels().await;
+        info!(
+            "🏘  community {} — {} channel(s), {} private",
+            &community.id()[..8.min(community.id().len())],
+            channels.len(),
+            channels.iter().filter(|c| c.is_private()).count()
+        );
+
+        let mut awaiting_key = Vec::new();
+        for ch in &channels {
+            let kind = if !ch.is_private() {
+                "public"
+            } else if ch.is_readable() {
+                "private, readable"
+            } else if community
+                .channel_members(ch.id())
+                .iter()
+                .any(|m| m.npub() == bot.npub())
+            {
+                awaiting_key.push(ch.name());
+                "private, GRANTED — awaiting key"
+            } else {
+                "private, no access"
+            };
+            info!("   #{} ({kind}, epoch {})", ch.name(), ch.epoch());
+        }
+
+        if !awaiting_key.is_empty() {
+            warn!(
+                "🔑 access granted but no key yet for {} channel(s): {}",
+                awaiting_key.len(),
+                awaiting_key.join(", ")
+            );
+        }
+    }
+}
+
+/// A private channel's key arrived, so it just became readable. `backfilled` messages predating the
+/// grant were pulled into local state, and they are history rather than delivery: they never arrive
+/// as live events. Seed the conversation memory from them so the first reply there isn't contextless.
+async fn handle_channel_keyed(
+    bot: VectorBot,
+    ctx: Arc<Ctx>,
+    community_id: &str,
+    channel_id: &str,
+    backfilled: usize,
+) {
+    let name = bot
+        .community(community_id)
+        .channels()
+        .await
+        .into_iter()
+        .find(|c| c.id() == channel_id)
+        .map(|c| c.name().to_string())
+        .unwrap_or_default();
+    info!("🔓 private channel #{name} ({channel_id}) is now readable, {backfilled} message(s) back-filled");
+
+    let seeded = seed_memory_from_history(&bot, &ctx, channel_id).await;
+    if seeded > 0 {
+        info!("📖 seeded {seeded} message(s) of #{name} history into context");
+    }
+
+    if ctx.cfg.announce_channel_access {
+        let _ = bot.channel(channel_id).send("Hey, I can see this channel now.").await;
+    }
+}
+
+/// Fill an empty channel memory from back-filled history. Returns how many turns were seeded;
+/// 0 if memory already had content.
+async fn seed_memory_from_history(bot: &VectorBot, ctx: &Ctx, chat_id: &str) -> usize {
+    if !ctx.store.read(chat_id, true).messages.is_empty() {
+        return 0;
+    }
+
+    // Local, pull-only, newest-first-then-chronological: exactly the window we want to prime with.
+    let limit = ctx.cfg.history_limit;
+    let recent = bot.channel(chat_id).history(limit).await;
+    if recent.is_empty() {
+        return 0;
+    }
+
+    ctx.store.update(chat_id, true, |m| {
+        for msg in &recent {
+            let text = msg.content.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if msg.mine {
+                m.push_assistant(text.to_string());
+            } else {
+                m.push_user(text.to_string(), msg.npub.clone());
+            }
+        }
+        m.trim(limit);
+    });
+    recent.len()
 }
 
 async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
