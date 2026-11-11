@@ -323,6 +323,10 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     let chat_id = msg.chat_id.clone();
     let author = msg.message.npub.clone();
     let limit = ctx.cfg.history_limit;
+    // Already in memory: a reply that arrived first pulled it in as what it answers.
+    if ctx.store.read(&chat_id, is_group).holds(Some(&msg.message.id)) {
+        return;
+    }
 
     // In a group channel we ingest *every* message for context, but only engage when addressed
     // (mentioned or replied to). An unaddressed message is recorded and we stop there; its files
@@ -363,12 +367,15 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     turn.images = read.images;
     turn.at = msg.message.at;
     turn.id = Some(msg.message.id.clone());
-    read_earlier_attachments(&bot, &ctx, &msg, &mut turn).await;
+    let earlier = read_earlier_attachments(&bot, &ctx, &msg, turn.author.as_deref()).await;
 
     // Record the user turn (race-safe) and take a trimmed snapshot for the prompt.
     let file_only = text.is_empty() && attached;
     let at = turn.at;
     let mut mem = ctx.store.update(&chat_id, is_group, |m| {
+        for t in earlier {
+            m.push(t);
+        }
         m.push(turn);
         m.trim(limit);
     });
@@ -433,44 +440,46 @@ fn with_file_names(text: &str, msg: &vector_sdk::Message) -> String {
 }
 
 /// Read the attachments this message points at that nobody has read yet: the message it replies
-/// to, and recent unaddressed messages in this channel that carried files. Each is read into its
-/// own turn in memory, where it was said; a reply target memory doesn't hold goes into `turn`.
-async fn read_earlier_attachments(bot: &VectorBot, ctx: &Ctx, msg: &IncomingMessage, turn: &mut StoredMessage) {
+/// to, and recent unaddressed messages from the same sender that carried files. A turn memory holds
+/// is read in place, where it was said; a reply target memory doesn't hold comes back as a turn of
+/// its own, to go just before this message.
+async fn read_earlier_attachments(bot: &VectorBot, ctx: &Ctx, msg: &IncomingMessage, sender: Option<&str>) -> Vec<StoredMessage> {
     let replied_to = msg.message.replied_to.as_str();
     let now = msg.message.at;
     let mem = ctx.store.read(&msg.chat_id, msg.is_group);
-    let mut wanted: Vec<String> = mem
+    let unread: Vec<String> = mem
         .messages
         .iter()
         .rev()
         .take(6)
-        .filter_map(|m| m.unread_from.clone().filter(|id| id == replied_to || (m.at + RECENT_ATTACHMENT_MS >= now && m.author == turn.author)))
+        .filter_map(|m| m.unread_from.clone().filter(|id| id == replied_to || (m.at + RECENT_ATTACHMENT_MS >= now && m.author.as_deref() == sender)))
         .collect();
-    // A reply to something memory already holds needs nothing more: read or not, it's handled above.
-    let reply_in_memory = mem.messages.iter().any(|m| m.unread_from.as_deref() == Some(replied_to) || m.id.as_deref() == Some(replied_to));
-    if !replied_to.is_empty() && !reply_in_memory && !wanted.iter().any(|id| id == replied_to) {
-        wanted.push(replied_to.to_string());
-    }
-    if wanted.is_empty() {
-        return;
+    let fetch_reply = !replied_to.is_empty() && !mem.holds(Some(replied_to));
+    if unread.is_empty() && !fetch_reply {
+        return Vec::new();
     }
     let history = bot.core().get_messages(&msg.chat_id, 200, 0).await;
-    for id in wanted {
-        let Some(earlier) = history.iter().find(|m| m.id == id && !m.mine && !m.attachments.is_empty()) else { continue };
+    let find = |id: &str| history.iter().find(|m| m.id == id && !m.mine && !m.attachments.is_empty());
+    for id in unread {
+        let Some(earlier) = find(&id) else { continue };
         let read = files::read(bot, earlier, &ctx.images_dir, ctx.cfg.vision).await;
-        let mut landed = false;
         ctx.store.update(&msg.chat_id, msg.is_group, |m| {
             let Some(t) = m.messages.iter_mut().find(|t| t.unread_from.as_deref() == Some(id.as_str())) else { return };
             t.content = join(t.content.trim_end(), &read.text);
-            t.images.extend(read.images.iter().cloned());
+            t.images.extend(read.images);
             t.unread_from = None;
-            landed = true;
         });
-        if !landed {
-            turn.content = join(&turn.content, &format!("(the message this replies to)\n{}", read.text));
-            turn.images.extend(read.images);
-        }
     }
+    let mut before = Vec::new();
+    if let Some(earlier) = fetch_reply.then(|| find(replied_to)).flatten() {
+        let read = files::read(bot, earlier, &ctx.images_dir, ctx.cfg.vision).await;
+        let mut t = StoredMessage::user(join(earlier.content.trim(), &read.text), earlier.npub.clone());
+        t.images = read.images;
+        t.at = earlier.at;
+        t.id = Some(earlier.id.clone());
+        before.push(t);
+    }
+    before
 }
 
 /// In a group channel, are we addressed? True if the message mentions our npub/hex in its text, or

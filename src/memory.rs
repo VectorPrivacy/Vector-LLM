@@ -86,8 +86,18 @@ impl ChannelMemory {
         self.messages.push(StoredMessage::user(content, author));
     }
 
+    /// Add a turn, unless one from the same Vector message is already here: two paths (a reply
+    /// pulling in what it answers, and that message's own arrival) can each bring it.
     pub fn push(&mut self, message: StoredMessage) {
+        if message.id.is_some() && self.holds(message.id.as_deref()) {
+            return;
+        }
         self.messages.push(message);
+    }
+
+    /// Whether a turn from Vector message `id` is held.
+    pub fn holds(&self, id: Option<&str>) -> bool {
+        id.is_some() && self.messages.iter().any(|m| m.id.as_deref() == id)
     }
 
     pub fn push_assistant(&mut self, content: String) {
@@ -172,4 +182,20 @@ fn load_or_default(data_dir: &str, chat_id: &str, is_group: bool) -> ChannelMemo
         log::warn!("memory load failed for {chat_id} ({e}); starting fresh");
         ChannelMemory { is_group, ..Default::default() }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_two_paths_bring_is_kept_once() {
+        let mut mem = ChannelMemory::default();
+        let turn = |text: &str| StoredMessage { id: Some("abc".into()), ..StoredMessage::user(text.into(), None) };
+        mem.push(turn("pulled in by the reply"));
+        mem.push(turn("its own arrival"));
+        mem.push_user("no id, always kept".into(), None);
+        assert_eq!(mem.messages.len(), 2);
+        assert!(mem.holds(Some("abc")) && !mem.holds(None));
+    }
 }
