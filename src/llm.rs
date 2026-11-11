@@ -26,7 +26,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
@@ -46,7 +46,7 @@ impl ChatMessage {
     }
 
     /// The message as the API takes it: plain text, or text and images as parts.
-    fn wire(&self) -> serde_json::Value {
+    pub(crate) fn wire(&self) -> serde_json::Value {
         if self.images.is_empty() {
             return serde_json::json!({ "role": self.role.as_str(), "content": self.content });
         }
@@ -131,6 +131,10 @@ impl LLMClient {
         }
 
         let body: ChatResponse = serde_json::from_slice(&bytes)?;
+        if let Some(u) = &body.usage {
+            let cached = u.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens).unwrap_or(0);
+            log::info!("🧾 {} tokens in ({cached} cached), {} out", u.prompt_tokens, u.completion_tokens);
+        }
         Ok(body.reply())
     }
 }
@@ -148,6 +152,24 @@ struct ChatRequest<'a> {
 struct ChatResponse {
     #[serde(default)]
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 impl ChatResponse {

@@ -104,10 +104,11 @@ impl ChannelMemory {
         self.messages.push(StoredMessage { role: Role::Assistant, ..StoredMessage::user(content, None) });
     }
 
-    /// Keep only the most recent `limit` turns.
+    /// Keep at most `limit` turns. Past it, the oldest quarter goes at once: the conversation's
+    /// start then holds still for the turns that follow, which is what a provider's prompt cache keys on.
     pub fn trim(&mut self, limit: usize) {
         if self.messages.len() > limit {
-            let cut = self.messages.len() - limit;
+            let cut = self.messages.len() - (limit - limit / 4);
             self.messages.drain(0..cut);
         }
     }
@@ -197,5 +198,21 @@ mod tests {
         mem.push_user("no id, always kept".into(), None);
         assert_eq!(mem.messages.len(), 2);
         assert!(mem.holds(Some("abc")) && !mem.holds(None));
+    }
+
+    #[test]
+    fn a_full_memory_sheds_its_oldest_quarter_at_once() {
+        let mut mem = ChannelMemory::default();
+        for i in 0..51 {
+            mem.push_user(i.to_string(), None);
+            mem.trim(50);
+        }
+        assert_eq!(mem.messages.len(), 38);
+        assert_eq!(mem.messages[0].content, "13");
+        for i in 51..63 {
+            mem.push_user(i.to_string(), None);
+            mem.trim(50);
+            assert_eq!(mem.messages[0].content, "13", "the start holds until the limit is passed again");
+        }
     }
 }
