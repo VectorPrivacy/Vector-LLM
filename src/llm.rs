@@ -78,18 +78,28 @@ impl LLMClient {
 
     /// Send a chat completion and return the assistant's reply text.
     pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
         let payload = ChatRequest {
             model: &self.model,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             messages: messages.iter().map(ChatMessage::wire).collect(),
         };
+        // An empty answer is usually the provider's hiccup: the same request once more.
+        match self.complete(&payload).await? {
+            Ok(content) => Ok(content),
+            Err(why) => {
+                log::warn!("LLM gave no reply ({why}), asking again");
+                self.complete(&payload).await?.map_err(|why| anyhow!("LLM gave no reply ({why})"))
+            }
+        }
+    }
 
+    /// One completion: the reply, or why there was none.
+    async fn complete(&self, payload: &ChatRequest<'_>) -> Result<std::result::Result<String, String>> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let http = build_http_client(Duration::from_secs(120)).map_err(|e| anyhow!(e))?;
         let request = || {
-            let req = http.post(url.as_str()).json(&payload);
+            let req = http.post(url.as_str()).json(payload);
             match &self.api_key {
                 Some(key) => req.bearer_auth(key),
                 None => req,
@@ -121,16 +131,7 @@ impl LLMClient {
         }
 
         let body: ChatResponse = serde_json::from_slice(&bytes)?;
-        let choice = body.choices.into_iter().next().ok_or_else(|| anyhow!("no choices in response"))?;
-
-        // Primary: chat format; fall back to legacy "text" some servers still emit.
-        let content = choice
-            .message
-            .map(|m| m.content)
-            .or(choice.text)
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("empty assistant content"))?;
-        Ok(content)
+        Ok(body.reply())
     }
 }
 
@@ -145,7 +146,24 @@ struct ChatRequest<'a> {
 
 #[derive(Deserialize)]
 struct ChatResponse {
+    #[serde(default)]
     choices: Vec<Choice>,
+}
+
+impl ChatResponse {
+    /// The first choice's text (chat format, else the legacy `text` some servers still emit), or
+    /// why there is none.
+    fn reply(self) -> std::result::Result<String, String> {
+        let Some(choice) = self.choices.into_iter().next() else {
+            return Err("no choices".into());
+        };
+        choice
+            .message
+            .and_then(|m| m.content)
+            .or(choice.text)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("empty content, finish_reason {}", choice.finish_reason.as_deref().unwrap_or("none")))
+    }
 }
 
 #[derive(Deserialize)]
@@ -154,10 +172,32 @@ struct Choice {
     message: Option<OwnedMessage>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct OwnedMessage {
     #[serde(default)]
-    content: String,
+    content: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(json: &str) -> std::result::Result<String, String> {
+        serde_json::from_str::<ChatResponse>(json).unwrap().reply()
+    }
+
+    #[test]
+    fn a_null_reply_is_no_reply_not_a_parse_error() {
+        assert_eq!(reply(r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#), Ok("hi".into()));
+        assert_eq!(
+            reply(r#"{"choices":[{"finish_reason":"content_filter","message":{"role":"assistant","content":null}}]}"#),
+            Err("empty content, finish_reason content_filter".into())
+        );
+        assert_eq!(reply(r#"{"choices":[{"text":"legacy"}]}"#), Ok("legacy".into()));
+        assert_eq!(reply(r#"{"choices":[]}"#), Err("no choices".into()));
+    }
 }
