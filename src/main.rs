@@ -289,6 +289,10 @@ async fn seed_memory_from_history(bot: &VectorBot, ctx: &Ctx, chat_id: &str) -> 
 /// message that does address us is about.
 const RECENT_ATTACHMENT_MS: u64 = 10 * 60_000;
 
+/// How long a file sent on its own waits for the words that usually follow it (a caption arrives as
+/// its own message): those answer for both, rather than two replies.
+const FILE_FOLLOW_UP: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     info!(
         "📥 recv group={} mine={} chat={} files={} text={:?}",
@@ -327,6 +331,7 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
         info!("🔇 group msg not addressed to us — recorded for context, no reply");
         let mut turn = StoredMessage::user(with_file_names(raw, &msg.message), author);
         turn.at = msg.message.at;
+        turn.id = Some(msg.message.id.clone());
         turn.unread_from = attached.then(|| msg.message.id.clone());
         ctx.store.update(&chat_id, is_group, |m| {
             m.push(turn);
@@ -357,13 +362,24 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     let mut turn = StoredMessage::user(join(&text, &read.text), author);
     turn.images = read.images;
     turn.at = msg.message.at;
+    turn.id = Some(msg.message.id.clone());
     read_earlier_attachments(&bot, &ctx, &msg, &mut turn).await;
 
     // Record the user turn (race-safe) and take a trimmed snapshot for the prompt.
-    let mem = ctx.store.update(&chat_id, is_group, |m| {
+    let file_only = text.is_empty() && attached;
+    let at = turn.at;
+    let mut mem = ctx.store.update(&chat_id, is_group, |m| {
         m.push(turn);
         m.trim(limit);
     });
+    if file_only {
+        tokio::time::sleep(FILE_FOLLOW_UP).await;
+        mem = ctx.store.read(&chat_id, is_group);
+        if mem.messages.iter().any(|m| m.role == llm::Role::User && m.at > at) {
+            info!("📎 file in {chat_id} followed by a message: that one answers for both");
+            return;
+        }
+    }
 
     let messages = prompt::build_messages(&mem, &ctx.cfg.system_prompt, &ctx.names, &ctx.images_dir).await;
 
@@ -430,7 +446,8 @@ async fn read_earlier_attachments(bot: &VectorBot, ctx: &Ctx, msg: &IncomingMess
         .take(6)
         .filter_map(|m| m.unread_from.clone().filter(|id| id == replied_to || (m.at + RECENT_ATTACHMENT_MS >= now && m.author == turn.author)))
         .collect();
-    let reply_in_memory = mem.messages.iter().any(|m| m.unread_from.as_deref() == Some(replied_to));
+    // A reply to something memory already holds needs nothing more: read or not, it's handled above.
+    let reply_in_memory = mem.messages.iter().any(|m| m.unread_from.as_deref() == Some(replied_to) || m.id.as_deref() == Some(replied_to));
     if !replied_to.is_empty() && !reply_in_memory && !wanted.iter().any(|id| id == replied_to) {
         wanted.push(replied_to.to_string());
     }

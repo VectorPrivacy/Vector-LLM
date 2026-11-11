@@ -29,6 +29,9 @@ pub struct StoredMessage {
     /// in a group that didn't address the bot is read only once someone asks about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread_from: Option<String>,
+    /// The Vector message it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// When it was sent (unix ms); 0 for turns stored before this was recorded.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub at: u64,
@@ -40,7 +43,7 @@ fn is_zero(n: &u64) -> bool {
 
 impl StoredMessage {
     pub fn user(content: String, author: Option<String>) -> Self {
-        Self { role: Role::User, content, author, images: Vec::new(), unread_from: None, at: 0 }
+        Self { role: Role::User, content, author, images: Vec::new(), unread_from: None, id: None, at: 0 }
     }
 }
 
