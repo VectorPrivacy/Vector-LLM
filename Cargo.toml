@@ -8,14 +8,14 @@ authors = ["Vector LLM Bot"]
 [dependencies]
 # The Vector SDK (discord.js-style): unified DM + group-chat messaging, communities,
 # reconnect/catch-up, and a re-exported `vector_core` (hardened HTTP client, raw client).
-vector_sdk = "0.8"
+vector_sdk = "0.12"
 # Must match vector_sdk's nostr-sdk EXACTLY or the raw `Client` types are two
 # distinct types and public mode will not compile. Pinned with `=` deliberately:
 # newer alphas exist, and a loose spec silently drifts off whatever the SDK
 # resolved to. Bump in lockstep with vector_sdk, never on its own.
 # Only needed by the optional `public` feature, which drops to the raw relay
 # client for kind:1 monitoring.
-nostr-sdk = { version = "=0.45.0", optional = true }
+nostr-sdk = { version = "=0.45.6", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

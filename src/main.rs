@@ -78,13 +78,9 @@ async fn main() -> Result<()> {
 
     // Broadcast the bot's profile (kind:0) so clients show a name/avatar and a bot badge.
     if cfg.publish_profile {
-        if bot
-            .update_profile(&cfg.bot_name, &cfg.bot_avatar, &cfg.bot_banner, &cfg.bot_about)
-            .await
-        {
-            info!("📇 Published profile as '{}'", cfg.bot_name);
-        } else {
-            warn!("Failed to publish profile");
+        match bot.update_profile(&cfg.bot_name, &cfg.bot_avatar, &cfg.bot_banner, &cfg.bot_about).await {
+            Ok(()) => info!("📇 Published profile as '{}'", cfg.bot_name),
+            Err(e) => warn!("Failed to publish profile: {e}"),
         }
     }
 
