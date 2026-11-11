@@ -8,6 +8,7 @@
 //!   - optionally monitors the public Nostr `kind:1` firehose (see [`public`]).
 
 mod config;
+mod files;
 mod llm;
 mod memory;
 mod names;
@@ -27,7 +28,7 @@ use vector_sdk::{BotEvent, IncomingMessage, VectorBot};
 
 use crate::config::{Config, InvitePolicyKind};
 use crate::llm::LLMClient;
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryStore, StoredMessage};
 use crate::names::NameResolver;
 use crate::util::sanitize_reply;
 
@@ -39,6 +40,8 @@ struct Ctx {
     store: MemoryStore,
     bot_npub: String,
     bot_hex: String,
+    /// Where pictures people send are kept for the model to look at.
+    images_dir: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -130,7 +133,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let ctx = Arc::new(Ctx { cfg, llm, names, store, bot_npub, bot_hex });
+    let images_dir = std::path::Path::new(&cfg.data_dir).join("images");
+    let ctx = Arc::new(Ctx { cfg, llm, names, store, bot_npub, bot_hex, images_dir });
 
     // Viktor's one slash command. Declaring it publishes the kind-10304
     // manifest, so `/clear` shows in a client's `/` picker; ordinary
@@ -281,19 +285,25 @@ async fn seed_memory_from_history(bot: &VectorBot, ctx: &Ctx, chat_id: &str) -> 
     recent.len()
 }
 
+/// How recently a picture or file sent in a group, without addressing us, counts as what the next
+/// message that does address us is about.
+const RECENT_ATTACHMENT_MS: u64 = 10 * 60_000;
+
 async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     info!(
-        "📥 recv group={} mine={} chat={} text={:?}",
+        "📥 recv group={} mine={} chat={} files={} text={:?}",
         msg.is_group,
         msg.is_mine(),
         &msg.chat_id[..12.min(msg.chat_id.len())],
+        msg.message.attachments.len(),
         msg.text().chars().take(50).collect::<String>()
     );
     if msg.is_mine() {
         return;
     }
     let raw = msg.text().trim();
-    if raw.is_empty() {
+    let attached = !msg.message.attachments.is_empty();
+    if raw.is_empty() && !attached {
         return;
     }
     let is_group = msg.is_group;
@@ -311,11 +321,15 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     let limit = ctx.cfg.history_limit;
 
     // In a group channel we ingest *every* message for context, but only engage when addressed
-    // (mentioned or replied to). An unaddressed message is recorded and we stop there.
+    // (mentioned or replied to). An unaddressed message is recorded and we stop there; its files
+    // are read only if someone asks us about them.
     if is_group && !is_addressed(&bot, &msg, &ctx.bot_npub, &ctx.bot_hex).await {
         info!("🔇 group msg not addressed to us — recorded for context, no reply");
+        let mut turn = StoredMessage::user(with_file_names(raw, &msg.message), author);
+        turn.at = msg.message.at;
+        turn.unread_from = attached.then(|| msg.message.id.clone());
         ctx.store.update(&chat_id, is_group, |m| {
-            m.push_user(raw.to_string(), author);
+            m.push(turn);
             m.trim(limit);
         });
         return;
@@ -329,21 +343,29 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
     } else {
         raw.to_string()
     };
-    if text.is_empty() {
+    if text.is_empty() && !attached {
         text = raw.to_string();
     }
-
-    // Record the user turn (race-safe) and take a trimmed snapshot for the prompt.
-    let mem = ctx.store.update(&chat_id, is_group, |m| {
-        m.push_user(text, author);
-        m.trim(limit);
-    });
 
     if ctx.cfg.typing_indicator {
         let _ = msg.channel().typing().await;
     }
 
-    let messages = prompt::build_messages(&mem, &ctx.cfg.system_prompt, &ctx.names).await;
+    // What came with this message, and anything earlier it points at: the message it replies to,
+    // and pictures or files sent just before without addressing us ("look at this, @Viktor").
+    let read = files::read(&bot, &msg.message, &ctx.images_dir, ctx.cfg.vision).await;
+    let mut turn = StoredMessage::user(join(&text, &read.text), author);
+    turn.images = read.images;
+    turn.at = msg.message.at;
+    read_earlier_attachments(&bot, &ctx, &msg, &mut turn).await;
+
+    // Record the user turn (race-safe) and take a trimmed snapshot for the prompt.
+    let mem = ctx.store.update(&chat_id, is_group, |m| {
+        m.push(turn);
+        m.trim(limit);
+    });
+
+    let messages = prompt::build_messages(&mem, &ctx.cfg.system_prompt, &ctx.names, &ctx.images_dir).await;
 
     info!("⚙️  engaging {chat_id} (group={is_group}) — calling LLM ({} ctx msgs)", messages.len());
     match ctx.llm.chat(messages).await {
@@ -369,6 +391,68 @@ async fn handle_message(bot: VectorBot, msg: IncomingMessage, ctx: Arc<Ctx>) {
             }
         }
         Err(e) => error!("❌ LLM request failed for {chat_id}: {e}"),
+    }
+}
+
+/// `text` and what its attachments came to, one after the other.
+fn join(text: &str, read: &str) -> String {
+    match (text.is_empty(), read.is_empty()) {
+        (_, true) => text.to_string(),
+        (true, false) => read.to_string(),
+        (false, false) => format!("{text}\n\n{read}"),
+    }
+}
+
+/// A message's text with the names of what it attached, for a turn whose files aren't read yet.
+fn with_file_names(text: &str, msg: &vector_sdk::Message) -> String {
+    if msg.attachments.is_empty() {
+        return text.to_string();
+    }
+    let names: Vec<String> = msg
+        .attachments
+        .iter()
+        .map(|a| if a.name.trim().is_empty() { format!("a .{} file", a.extension) } else { a.name.clone() })
+        .collect();
+    join(text, &format!("[attached: {}]", names.join(", ")))
+}
+
+/// Read the attachments this message points at that nobody has read yet: the message it replies
+/// to, and recent unaddressed messages in this channel that carried files. Each is read into its
+/// own turn in memory, where it was said; a reply target memory doesn't hold goes into `turn`.
+async fn read_earlier_attachments(bot: &VectorBot, ctx: &Ctx, msg: &IncomingMessage, turn: &mut StoredMessage) {
+    let replied_to = msg.message.replied_to.as_str();
+    let now = msg.message.at;
+    let mem = ctx.store.read(&msg.chat_id, msg.is_group);
+    let mut wanted: Vec<String> = mem
+        .messages
+        .iter()
+        .rev()
+        .take(6)
+        .filter_map(|m| m.unread_from.clone().filter(|id| id == replied_to || (m.at + RECENT_ATTACHMENT_MS >= now && m.author == turn.author)))
+        .collect();
+    let reply_in_memory = mem.messages.iter().any(|m| m.unread_from.as_deref() == Some(replied_to));
+    if !replied_to.is_empty() && !reply_in_memory && !wanted.iter().any(|id| id == replied_to) {
+        wanted.push(replied_to.to_string());
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    let history = bot.core().get_messages(&msg.chat_id, 200, 0).await;
+    for id in wanted {
+        let Some(earlier) = history.iter().find(|m| m.id == id && !m.mine && !m.attachments.is_empty()) else { continue };
+        let read = files::read(bot, earlier, &ctx.images_dir, ctx.cfg.vision).await;
+        let mut landed = false;
+        ctx.store.update(&msg.chat_id, msg.is_group, |m| {
+            let Some(t) = m.messages.iter_mut().find(|t| t.unread_from.as_deref() == Some(id.as_str())) else { return };
+            t.content = join(t.content.trim_end(), &read.text);
+            t.images.extend(read.images.iter().cloned());
+            t.unread_from = None;
+            landed = true;
+        });
+        if !landed {
+            turn.content = join(&turn.content, &format!("(the message this replies to)\n{}", read.text));
+            turn.images.extend(read.images);
+        }
     }
 }
 

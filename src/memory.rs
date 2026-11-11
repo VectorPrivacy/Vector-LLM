@@ -22,6 +22,26 @@ pub struct StoredMessage {
     /// Absent for assistant turns and for DMs (a single, implicit counterparty).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// Pictures that came with it, saved under `<data_dir>/images/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    /// The Vector message it came from, while its attachments haven't been read yet: a message
+    /// in a group that didn't address the bot is read only once someone asks about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_from: Option<String>,
+    /// When it was sent (unix ms); 0 for turns stored before this was recorded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl StoredMessage {
+    pub fn user(content: String, author: Option<String>) -> Self {
+        Self { role: Role::User, content, author, images: Vec::new(), unread_from: None, at: 0 }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,11 +80,15 @@ impl ChannelMemory {
     }
 
     pub fn push_user(&mut self, content: String, author: Option<String>) {
-        self.messages.push(StoredMessage { role: Role::User, content, author });
+        self.messages.push(StoredMessage::user(content, author));
+    }
+
+    pub fn push(&mut self, message: StoredMessage) {
+        self.messages.push(message);
     }
 
     pub fn push_assistant(&mut self, content: String) {
-        self.messages.push(StoredMessage { role: Role::Assistant, content, author: None });
+        self.messages.push(StoredMessage { role: Role::Assistant, ..StoredMessage::user(content, None) });
     }
 
     /// Keep only the most recent `limit` turns.

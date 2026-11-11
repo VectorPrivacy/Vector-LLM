@@ -23,6 +23,10 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 hex = "0.4"
+# Attachments: pictures go to the model as base64 images; PDFs and Word files are read as text.
+base64 = "0.22"
+pdf-extract = "0.12"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [features]
 # The kind:1 firehose. OFF by default: nostr-sdk 0.45 removed signing from

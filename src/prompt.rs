@@ -7,22 +7,52 @@
 //!   so the model can follow who said what without spending tokens on a full npub per line.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::llm::{ChatMessage, Role};
-use crate::memory::ChannelMemory;
+use crate::memory::{ChannelMemory, StoredMessage};
 use crate::names::{short_npub, NameResolver};
+
+/// Pictures the model sees at once: the newest in the conversation. Older ones stay in memory
+/// as a note, so a long chat doesn't resend every picture each turn.
+const IMAGES_IN_CONTEXT: usize = 4;
+
+/// A user turn with its pictures: the newest [`IMAGES_IN_CONTEXT`] go along, older ones become a note.
+fn with_images(content: String, m: &StoredMessage, shown: &mut usize, images_dir: &Path) -> ChatMessage {
+    let mut msg = ChatMessage::user(content);
+    for file in m.images.iter().rev() {
+        let url = (*shown < IMAGES_IN_CONTEXT).then(|| crate::files::data_url(images_dir, file)).flatten();
+        match url {
+            Some(url) => {
+                *shown += 1;
+                msg.images.insert(0, url);
+            }
+            None => msg.content.push_str("\n[an earlier picture, no longer shown]"),
+        }
+    }
+    msg
+}
 
 pub async fn build_messages(
     mem: &ChannelMemory,
     system_prompt: &str,
     names: &NameResolver,
+    images_dir: &Path,
 ) -> Vec<ChatMessage> {
+    let mut shown = 0;
     if !mem.is_group {
-        let mut out = Vec::with_capacity(mem.messages.len() + 1);
-        out.push(ChatMessage::system(system_prompt));
-        for m in &mem.messages {
-            out.push(ChatMessage { role: m.role, content: m.content.clone() });
+        // Newest first, so the newest pictures are the ones shown; then back in order.
+        let mut turns: Vec<ChatMessage> = Vec::with_capacity(mem.messages.len());
+        for m in mem.messages.iter().rev() {
+            turns.push(match m.role {
+                Role::User => with_images(m.content.clone(), m, &mut shown, images_dir),
+                role => ChatMessage { role, ..ChatMessage::user(m.content.clone()) },
+            });
         }
+        turns.reverse();
+        let mut out = Vec::with_capacity(turns.len() + 1);
+        out.push(ChatMessage::system(system_prompt));
+        out.extend(turns);
         return out;
     }
 
@@ -59,11 +89,10 @@ pub async fn build_messages(
         }
     }
 
-    let mut out = Vec::with_capacity(mem.messages.len() + 1);
-    out.push(ChatMessage::system(system));
-    for m in &mem.messages {
-        match m.role {
-            Role::Assistant => out.push(ChatMessage::assistant(m.content.clone())),
+    let mut turns: Vec<ChatMessage> = Vec::with_capacity(mem.messages.len());
+    for m in mem.messages.iter().rev() {
+        turns.push(match m.role {
+            Role::Assistant => ChatMessage::assistant(m.content.clone()),
             _ => {
                 let label = m
                     .author
@@ -71,9 +100,38 @@ pub async fn build_messages(
                     .and_then(|a| label_for.get(a))
                     .cloned()
                     .unwrap_or_else(|| "user".to_string());
-                out.push(ChatMessage::user(format!("{label}: {}", m.content)));
+                with_images(format!("{label}: {}", m.content), m, &mut shown, images_dir)
             }
-        }
+        });
     }
+    turns.reverse();
+    let mut out = Vec::with_capacity(turns.len() + 1);
+    out.push(ChatMessage::system(system));
+    out.extend(turns);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_newest_pictures_go_along() {
+        let dir = std::env::temp_dir().join(format!("viktor-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let turns: Vec<StoredMessage> = (0..6)
+            .map(|i| {
+                let file = format!("m{i}-0.png");
+                std::fs::write(dir.join(&file), [i as u8; 4]).unwrap();
+                StoredMessage { images: vec![file], ..StoredMessage::user(format!("picture {i}"), None) }
+            })
+            .collect();
+        let mut shown = 0;
+        let built: Vec<ChatMessage> = turns.iter().rev().map(|m| with_images(m.content.clone(), m, &mut shown, &dir)).collect();
+        let with: Vec<bool> = built.iter().rev().map(|m| !m.images.is_empty()).collect();
+        assert_eq!(with, [false, false, true, true, true, true], "the newest four");
+        assert!(built.last().unwrap().content.ends_with("[an earlier picture, no longer shown]"));
+        assert!(built[0].images[0].starts_with("data:image/png;base64,"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

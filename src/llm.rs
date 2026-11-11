@@ -30,17 +30,29 @@ impl Role {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Pictures that go with the text, as `data:` URLs.
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
+        Self { role: Role::System, content: content.into(), images: Vec::new() }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into() }
+        Self { role: Role::User, content: content.into(), images: Vec::new() }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into() }
+        Self { role: Role::Assistant, content: content.into(), images: Vec::new() }
+    }
+
+    /// The message as the API takes it: plain text, or text and images as parts.
+    fn wire(&self) -> serde_json::Value {
+        if self.images.is_empty() {
+            return serde_json::json!({ "role": self.role.as_str(), "content": self.content });
+        }
+        let mut parts = vec![serde_json::json!({ "type": "text", "text": self.content })];
+        parts.extend(self.images.iter().map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })));
+        serde_json::json!({ "role": self.role.as_str(), "content": parts })
     }
 }
 
@@ -72,13 +84,10 @@ impl LLMClient {
             model: &self.model,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
-            messages: messages
-                .iter()
-                .map(|m| WireMessage { role: m.role.as_str(), content: &m.content })
-                .collect(),
+            messages: messages.iter().map(ChatMessage::wire).collect(),
         };
 
-        let http = build_http_client(Duration::from_secs(60)).map_err(|e| anyhow!(e))?;
+        let http = build_http_client(Duration::from_secs(120)).map_err(|e| anyhow!(e))?;
         let mut req = http.post(url).json(&payload);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -115,13 +124,7 @@ struct ChatRequest<'a> {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    messages: Vec<WireMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct WireMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+    messages: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

@@ -25,6 +25,9 @@ pub struct Config {
     /// Cap on response length. Important for reasoning models (else replies truncate or come back
     /// empty). Sent only when set.
     pub max_tokens: Option<u32>,
+    /// Whether the model takes images: pictures users send go to it as images when on, and as
+    /// a note that one was sent when off.
+    pub vision: bool,
 
     // --- Context window + storage ---
     /// Max user/assistant turns retained per channel for LLM context.
@@ -116,6 +119,7 @@ impl Config {
             model,
             temperature: env_parse("LLM_TEMPERATURE", 0.2_f32),
             max_tokens: env_opt("LLM_MAX_TOKENS").and_then(|v| v.parse().ok()),
+            vision: env_bool("LLM_VISION", true),
 
             history_limit: env_parse("HISTORY_LIMIT", 16_usize).max(2),
             data_dir: env_str("DATA_DIR", "data"),
