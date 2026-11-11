@@ -88,12 +88,28 @@ impl LLMClient {
         };
 
         let http = build_http_client(Duration::from_secs(120)).map_err(|e| anyhow!(e))?;
-        let mut req = http.post(url).json(&payload);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
+        let request = || {
+            let req = http.post(url.as_str()).json(&payload);
+            match &self.api_key {
+                Some(key) => req.bearer_auth(key),
+                None => req,
+            }
+        };
 
-        let resp = req.send().await?;
+        // A connection the server closed between requests fails at once: one more try, on a new one.
+        let resp = match request().send().await {
+            Ok(resp) => resp,
+            // A refusal by the network's rules (Tor or I2P only) stays one.
+            Err(e) if e.is_policy_refusal() => return Err(e.into()),
+            Err(e) => {
+                if e.is_transient() {
+                    vector_sdk::vector_core::net::wait_after(&e).await.map_err(|why| anyhow!(why))?;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                request().send().await?
+            }
+        };
         let status = resp.status();
         let bytes = resp.bytes().await?;
         if !status.is_success() {
